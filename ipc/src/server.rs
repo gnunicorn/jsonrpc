@@ -148,8 +148,10 @@ impl<M: Metadata, S: Middleware<M>> ServerBuilder<M, S> {
 					endpoint_addr: &remote_id,
 					session_id,
 					sender,
+				//  ^^^^^^ passing in sender meanse meta holds `sender` 
 				});
 				let service = Service::new(rpc_handler.clone(), meta);
+				//  ^^^^^^^ service now holds meta, which holds `sender`
 				let (writer, reader) = io_stream.framed(
 					codecs::StreamCodec::new(
 						incoming_separator.clone(),
@@ -157,7 +159,10 @@ impl<M: Metadata, S: Middleware<M>> ServerBuilder<M, S> {
 					)
 				).split();
 				let responses = reader.and_then(move |req| {
+				//              ^^^^^^ reader becomes our main holder of everything
 					service.call(req).then(move |response| match response {
+				//  ^^^^^^^ service moved here in the fn
+				//          means `responses` now holds a reference to service, which holds `sender`
 						Err(e) => {
 							warn!(target: "ipc", "Error while processing request: {:?}", e);
 							future::ok(None)
@@ -173,16 +178,26 @@ impl<M: Metadata, S: Middleware<M>> ServerBuilder<M, S> {
 				})
 				.filter_map(|x| x)
 				.select(receiver.map_err(|e| {
+					//  ^^^^^^^^ now responses also holds a reference to `receiver`, too
+					//           thus `responsens` internally circles by holding receiver and sender
 					warn!(target: "ipc", "Notification error: {:?}", e);
 					std::io::ErrorKind::Other.into()
 				}));
 
 				let writer = writer.send_all(responses).then(move |_| {
+				//                           ^^^^^^^^^ passing all this to `writer`
+				//                                     means `writer` now holds the entire circle internally
+				//  
+				// however, not reader.and_then nor receiver ever fires, as receiver would fire on drop
+				// of `sender`, which doesn't happen as it is bound to `responses` already, which isn't being
+				// dropped, as it will be referenced by writer for 
 					trace!(target: "ipc", "Peer: service finished");
 					session_stats.as_ref().map(|stats| stats.close_session(session_id));
 					Ok(())
 				});
 
+				// now spawning writer and its internal circle of futures that never fire but because of
+				// the circle are kept around. leaking connections as they are never internally dropped
 				remote.spawn(|_| writer);
 
 				Ok(())
